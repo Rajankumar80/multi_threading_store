@@ -1,0 +1,406 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ ENV VARS — setdefault so worker.py's forceful os.environ[k]=v wins when  │
+# │ running inside a managed process. Standalone usage gets these defaults.  │
+# └──────────────────────────────────────────────────────────────────────────┘
+import os
+for _k, _v in {
+    "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
+    "OPENBLAS_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+    "VECLIB_MAXIMUM_THREADS": "1", "OPENVINO_THREAD_NUM": "1",
+    "TF_NUM_INTRAOP_THREADS": "1", "TF_NUM_INTEROP_THREADS": "1",
+}.items():
+    os.environ.setdefault(_k, _v)
+
+import asyncio
+import concurrent.futures
+import json
+import sys
+import threading
+import time
+from typing import Optional
+
+import cv2
+import numpy as np
+import supervision as sv
+import torch
+from ultralytics import YOLO
+
+from config import CameraConfig
+from gender_classifier import GenderClassifier
+from zone import ZoneManager
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+
+# ─── PALETTE ───────────────────────────────────────────────────────────────────
+C_WHITE      = (255, 255, 255)
+C_BLACK      = (  0,   0,   0)
+C_DARK       = ( 18,  18,  26)
+C_ACCENT     = (255, 200,  60)
+C_GREEN      = ( 60, 220, 120)
+C_RED        = ( 60,  60, 230)
+C_BBOX       = (  0, 100,   0)
+C_LABEL_TEXT = (  0, 255,   0)
+
+_ZONE_COLOR_BANK = [
+    (255, 190,  60), (100, 220, 100), ( 60, 160, 255), (255, 100, 100),
+    (180,  80, 220), (  0, 210, 210), (255, 220,   0), (255, 140,  40),
+    (160, 255, 160), (255, 130, 220),
+]
+
+
+def draw_filled_rect_alpha(img, x1, y1, x2, y2, color, alpha=0.55):
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
+    if x2 <= x1 or y2 <= y1:
+        return
+    sub  = img[y1:y2, x1:x2]
+    rect = np.full(sub.shape, color, dtype=np.uint8)
+    cv2.addWeighted(rect, alpha, sub, 1 - alpha, 0, sub)
+    img[y1:y2, x1:x2] = sub
+
+
+def draw_label_with_bg(img, text, x, y, text_color=C_WHITE,
+                       bg_color=C_DARK, font_scale=0.5, thickness=1, pad=6):
+    font = cv2.FONT_HERSHEY_DUPLEX
+    (tw, th), _ = cv2.getTextSize(text, font, font_scale, thickness)
+    draw_filled_rect_alpha(img, x-pad, y-th-pad, x+tw+pad, y+pad, bg_color, 0.75)
+    cv2.putText(img, text, (x, y), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+
+class Detector:
+    """
+    Single-camera tracking pipeline confined to ~1 CPU core.
+    Accepts CameraConfig so multiple instances run in separate processes.
+
+    Threading model
+    ───────────────
+    Main thread   — OV detect → ByteTrack → zone hysteresis → draw
+    Gender thread — ThreadPoolExecutor(max_workers=1), Future-based skip
+    I/O thread    — asyncio event loop, non-blocking JSON writes
+    """
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        self.cfg = cfg
+
+        self.model = YOLO(cfg.yolo_model, task="detect")
+        self.model(np.zeros((640, 640, 3), dtype=np.uint8), verbose=False)
+
+        self.tracker      = sv.ByteTrack()
+        self.gender_model = GenderClassifier(cfg.gender_model)
+
+        with open(cfg.zone_file) as f:
+            camera_data = json.load(f)[cfg.camera_id]
+
+        self.zm = ZoneManager(camera_data,
+                              entry_frames=cfg.entry_frames,
+                              exit_frames=cfg.exit_frames)
+
+        self.zone_color = {
+            name: _ZONE_COLOR_BANK[idx % len(_ZONE_COLOR_BANK)]
+            for idx, name in enumerate(self.zm.zones_pixel)
+        }
+
+        # Pre-compute polygon arrays (avoid per-frame allocation)
+        self._zone_polys_px:    dict[str, Optional[np.ndarray]] = {}
+        self._zone_polys_world: dict[str, Optional[np.ndarray]] = {}
+        for name in self.zm.zones_pixel:
+            px, wd = self.zm.zones_pixel[name], self.zm.zones_world[name]
+            self._zone_polys_px[name]    = np.array(px, dtype=np.float32) if len(px) >= 3 else None
+            self._zone_polys_world[name] = np.array(wd, dtype=np.float32) if len(wd) >= 3 else None
+
+        # Pre-compute floor-map zone centroids
+        self.MAP_SCALE, self.MAP_W, self.MAP_H = 150, 900, 750
+        self._zone_centroids: dict[str, tuple[int, int]] = {}
+        for name, pw in self.zm.zones_world.items():
+            if len(pw) < 3:
+                continue
+            pts = np.array([[int(p[0]*self.MAP_SCALE), int(p[1]*self.MAP_SCALE)]
+                            for p in pw], dtype=np.int32)
+            self._zone_centroids[name] = (int(np.mean(pts[:,0])), int(np.mean(pts[:,1])))
+
+        self._floor_canvas = np.zeros((self.MAP_H, self.MAP_W, 3), dtype=np.uint8)
+        self._build_floor_base()
+
+        self._gender_cache: dict[int, dict] = {}
+        self._cache_lock = threading.Lock()
+        self._gender_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"gender-{cfg.camera_id}")
+        self._gender_future: Optional[concurrent.futures.Future] = None
+        self._frame_count = 0
+
+        self._io_loop = asyncio.new_event_loop()
+        self._io_thread = threading.Thread(
+            target=self._run_io_loop, daemon=True, name=f"io-{cfg.camera_id}")
+        self._io_thread.start()
+
+        self.event_log:          list  = []
+        self._flushed_count:     int   = 0
+        self.metrics_log:        list  = []
+        self._last_metrics:      float = 0.0
+        self._last_events_flush: float = 0.0
+
+    # ── I/O ───────────────────────────────────────────────────────────────────
+
+    def _run_io_loop(self) -> None:
+        asyncio.set_event_loop(self._io_loop)
+        self._io_loop.run_forever()
+
+    async def _async_write_json(self, filepath: str, data) -> None:
+        loop    = asyncio.get_running_loop()
+        payload = await loop.run_in_executor(
+            None, lambda: json.dumps(data, indent=2, default=str))
+        try:
+            with open(filepath, "w") as f:
+                f.write(payload)
+        except OSError as e:
+            print(f"[{self.cfg.camera_id}][io] {e}", file=sys.stderr)
+
+    def _enqueue_write(self, filepath: str, data) -> None:
+        asyncio.run_coroutine_threadsafe(
+            self._async_write_json(filepath, data), self._io_loop)
+
+    # ── Gender ────────────────────────────────────────────────────────────────
+
+    def _run_gender_inference(self, frame, boxes, ids) -> None:
+        try:
+            with self._cache_lock:
+                snap = dict(self._gender_cache)
+            stale_idx, stale_boxes = [], []
+            for i, tid in enumerate(ids):
+                c = snap.get(tid)
+                if (c and c["age"] < self.cfg.gender_cache_ttl
+                        and c["confidence"] >= self.cfg.gender_conf_thresh):
+                    with self._cache_lock:
+                        if tid in self._gender_cache:
+                            self._gender_cache[tid]["age"] += 1
+                else:
+                    stale_idx.append(i); stale_boxes.append(boxes[i])
+            if stale_boxes:
+                preds = self.gender_model.predict(frame, stale_boxes)
+                with self._cache_lock:
+                    for pos, orig_i in enumerate(stale_idx):
+                        self._gender_cache[ids[orig_i]] = {
+                            "label": preds[pos]["label"],
+                            "confidence": preds[pos]["confidence"], "age": 0}
+            active = set(ids)
+            with self._cache_lock:
+                for tid in [k for k in self._gender_cache if k not in active]:
+                    del self._gender_cache[tid]
+        except Exception as e:
+            print(f"[{self.cfg.camera_id}][gender] {e}", file=sys.stderr)
+
+    def _maybe_submit_gender(self, frame, boxes, ids) -> None:
+        if self._frame_count % self.cfg.gender_skip_frames != 0:
+            return
+        if self._gender_future is not None and not self._gender_future.done():
+            return
+        self._gender_future = self._gender_executor.submit(
+            self._run_gender_inference, frame.copy(), boxes, ids)
+
+    # ── Floor map ─────────────────────────────────────────────────────────────
+
+    def _build_floor_base(self) -> None:
+        self._floor_canvas[:] = (22, 22, 30)
+        for x in range(0, self.MAP_W, self.MAP_SCALE):
+            cv2.line(self._floor_canvas, (x, 0), (x, self.MAP_H), (45,45,55), 1)
+            cv2.putText(self._floor_canvas, f"{x//self.MAP_SCALE}m",
+                        (x+3, 13), cv2.FONT_HERSHEY_DUPLEX, 0.3, (80,80,100), 1)
+        for y in range(0, self.MAP_H, self.MAP_SCALE):
+            cv2.line(self._floor_canvas, (0, y), (self.MAP_W, y), (45,45,55), 1)
+            cv2.putText(self._floor_canvas, f"{y//self.MAP_SCALE}m",
+                        (3, y+13), cv2.FONT_HERSHEY_DUPLEX, 0.3, (80,80,100), 1)
+        for name, pw in self.zm.zones_world.items():
+            if len(pw) < 3: continue
+            pts = np.array([[int(p[0]*self.MAP_SCALE), int(p[1]*self.MAP_SCALE)]
+                            for p in pw], dtype=np.int32)
+            cv2.polylines(self._floor_canvas, [pts], True, self.zone_color[name], 2, cv2.LINE_AA)
+        cv2.rectangle(self._floor_canvas, (0,0), (self.MAP_W,24), (30,30,40), -1)
+        cv2.line(self._floor_canvas, (0,24), (self.MAP_W,24), C_ACCENT, 1)
+        title = f"FLOOR MAP — {self.cfg.camera_id}  (core {self.cfg.core_id})"
+        cv2.putText(self._floor_canvas, title,
+                    (self.MAP_W//2-160, 17), cv2.FONT_HERSHEY_DUPLEX, 0.42, C_ACCENT, 1)
+        lx, ly = self.MAP_W-140, self.MAP_H-52
+        draw_filled_rect_alpha(self._floor_canvas, lx-8, ly-14, self.MAP_W-6,
+                               self.MAP_H-6, C_DARK, 0.70)
+        cv2.circle(self._floor_canvas, (lx+6, ly),    5, (180,180,180), -1)
+        cv2.putText(self._floor_canvas, "open area", (lx+16, ly+4),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.36, (180,180,180), 1)
+        cv2.circle(self._floor_canvas, (lx+6, ly+22), 5, C_GREEN, -1)
+        cv2.putText(self._floor_canvas, "in zone", (lx+16, ly+26),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.36, C_GREEN, 1)
+
+    # ── Per-frame drawing ─────────────────────────────────────────────────────
+
+    def _draw_hud(self, output: np.ndarray) -> None:
+        font = cv2.FONT_HERSHEY_DUPLEX
+        pad, row_h, col_w, label_w = 14, 36, 110, 115
+        n = len(self.zm.zones_pixel)
+        pw = label_w + 3*col_w + 2*pad
+        ph = pad + 28 + n*row_h + pad + 22
+
+        draw_filled_rect_alpha(output, 10, 10, 10+pw, 10+ph, C_DARK, 0.72)
+        cv2.rectangle(output, (10,10), (10+pw, 10+ph), C_ACCENT, 1)
+        hx, hy = 10+pad, 10+pad+16
+
+        cv2.putText(output, f"{self.cfg.camera_id}  |  core {self.cfg.core_id}",
+                    (hx, hy), font, 0.40, C_ACCENT, 1, cv2.LINE_AA)
+        hy += 22
+        for title, offset in zip(["ZONE","NOW","ENTRY","EXIT"],
+                                  [0, label_w, label_w+col_w, label_w+2*col_w]):
+            cv2.putText(output, title, (hx+offset, hy), font, 0.42, C_ACCENT, 1, cv2.LINE_AA)
+        div_y = hy + 6
+        cv2.line(output, (10+pad, div_y), (10+pw-pad, div_y), C_ACCENT, 1)
+
+        for i, zone in enumerate(self.zm.zones_pixel):
+            ry = div_y + 8 + (i+1)*row_h - 6
+            inside  = len(self.zm.confirmed_inside[zone])
+            z_color = self.zone_color[zone]
+            cv2.circle(output, (hx+6, ry-5), 5, z_color, -1)
+            cv2.putText(output, zone.upper(), (hx+18, ry), font, 0.44, z_color, 1, cv2.LINE_AA)
+            cv2.putText(output, str(inside), (hx+label_w+30, ry), font, 0.55,
+                        C_GREEN if inside > 0 else C_WHITE, 1, cv2.LINE_AA)
+            cv2.putText(output, str(self.zm.zone_entry_count[zone]),
+                        (hx+label_w+col_w+20, ry), font, 0.55, C_GREEN, 1, cv2.LINE_AA)
+            cv2.putText(output, str(self.zm.zone_exit_count[zone]),
+                        (hx+label_w+2*col_w+20, ry), font, 0.55, C_RED, 1, cv2.LINE_AA)
+
+    def _draw_zones(self, output: np.ndarray) -> None:
+        for name, poly in self.zm.zones_pixel.items():
+            if len(poly) < 3: continue
+            cv2.polylines(output, [np.array(poly, dtype=np.int32)],
+                          True, self.zone_color[name], 2, cv2.LINE_AA)
+            cx = int(np.mean([p[0] for p in poly]))
+            cy = int(np.mean([p[1] for p in poly]))
+            draw_label_with_bg(output, name.upper(), cx-30, cy,
+                               text_color=self.zone_color[name], bg_color=C_DARK)
+
+    def _draw_track(self, output: np.ndarray, track: dict) -> None:
+        x1, y1, x2, y2 = track["bbox"]
+        label = f"ID {track['id']} | {track.get('gender','?')}"
+        font  = cv2.FONT_HERSHEY_SIMPLEX
+        (tw, th), _ = cv2.getTextSize(label, font, 0.5, 1)
+        cv2.rectangle(output, (x1,y1), (x2,y2), C_BBOX, 1)
+        cv2.circle(output, track["foot"], 4, C_BBOX, -1)
+        lx = max(0, x1)
+        ly = y1 if y1-th-8 >= 0 else y2+th+8
+        rx = min(output.shape[1], lx+tw+6)
+        cv2.rectangle(output, (lx, ly-th-8), (rx, ly), C_BLACK, -1)
+        cv2.putText(output, label, (lx+3, ly-4), font, 0.5, C_LABEL_TEXT, 1, cv2.LINE_AA)
+
+    def _draw_floor_map(self, tracks: list) -> np.ndarray:
+        fm = self._floor_canvas.copy()
+        for name in self.zm.zones_world:
+            if name not in self._zone_centroids: continue
+            cx, cy = self._zone_centroids[name]
+            color  = self.zone_color[name]
+            cv2.putText(fm, name.upper(), (cx-34, cy-24),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.45, color, 1)
+            cv2.putText(fm, f"NOW {len(self.zm.confirmed_inside[name])}",
+                        (cx-38, cy), cv2.FONT_HERSHEY_DUPLEX, 0.40, C_GREEN, 1)
+            cv2.putText(fm, f"E:{self.zm.zone_entry_count[name]}",
+                        (cx-38, cy+20), cv2.FONT_HERSHEY_DUPLEX, 0.38, (120,255,120), 1)
+            cv2.putText(fm, f"X:{self.zm.zone_exit_count[name]}",
+                        (cx+14, cy+20), cv2.FONT_HERSHEY_DUPLEX, 0.38, (80,80,230), 1)
+        for track in tracks:
+            wp = self.zm.pixel_to_world(track["foot"][0], track["foot"][1])
+            if wp is None: continue
+            mx, my = int(wp[0]*self.MAP_SCALE), int(wp[1]*self.MAP_SCALE)
+            if not (0 <= mx < self.MAP_W and 0 <= my < self.MAP_H): continue
+            dot = C_GREEN if track["zones"] else (180,180,180)
+            cv2.circle(fm, (mx,my), 8, dot, -1)
+            cv2.circle(fm, (mx,my), 9, C_WHITE, 1)
+            cv2.putText(fm, str(track["id"]), (mx+11,my+4),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.38, dot, 1)
+        return fm
+
+    # ── Main per-frame entry point ─────────────────────────────────────────────
+
+    def process_frame(self, frame: np.ndarray):
+        now    = time.time()
+        output = frame.copy()
+        self._frame_count += 1
+
+        results = self.model(frame, conf=0.1, iou=0.7, classes=0, verbose=False)
+        result  = results[0]
+        active_ids: set[int] = set()
+        tracks:     list     = []
+
+        if result.boxes is not None and len(result.boxes) > 0:
+            tracked = self.tracker.update_with_detections(
+                sv.Detections.from_ultralytics(result))
+
+            if tracked.tracker_id is not None and len(tracked) > 0:
+                boxes = tracked.xyxy
+                ids   = tracked.tracker_id.astype(int)
+
+                for i in range(len(tracked)):
+                    x1,y1,x2,y2 = boxes[i].astype(int)
+                    tid          = int(ids[i])
+                    foot_pixel   = (int((x1+x2)/2), int(y2))
+                    active_ids.add(tid)
+                    world_pt     = self.zm.pixel_to_world(foot_pixel[0], foot_pixel[1])
+
+                    person_zones: list[str] = []
+                    for zone_name in self.zm.zones_pixel:
+                        ppx, pwd = self._zone_polys_px[zone_name], self._zone_polys_world[zone_name]
+                        if ppx is None:
+                            raw = False
+                        elif world_pt is not None and pwd is not None:
+                            raw = cv2.pointPolygonTest(pwd, tuple(world_pt), False) >= 0
+                        else:
+                            raw = cv2.pointPolygonTest(ppx, foot_pixel, False) >= 0
+                        self.zm.apply_hysteresis(tid, zone_name, raw, now, self.event_log)
+                        if tid in self.zm.confirmed_inside[zone_name]:
+                            person_zones.append(zone_name)
+
+                    cached = self._gender_cache.get(tid)
+                    tracks.append({"id": tid, "bbox": (x1,y1,x2,y2),
+                                   "foot": foot_pixel, "zones": person_zones,
+                                   "gender": cached["label"] if cached else "?"})
+
+                self._maybe_submit_gender(frame, boxes, ids)
+
+        self.zm.cleanup_lost_tracks(active_ids, now, self.event_log)
+        with self._cache_lock:
+            for tid in [k for k in self._gender_cache if k not in active_ids]:
+                del self._gender_cache[tid]
+
+        self._draw_zones(output)
+        for track in tracks:
+            self._draw_track(output, track)
+        self._draw_hud(output)
+        floor_map = self._draw_floor_map(tracks)
+
+        cfg = self.cfg
+        if now - self._last_events_flush >= cfg.events_flush_interval:
+            new = self.event_log[self._flushed_count:]
+            if new:
+                self._enqueue_write(cfg.events_file, {"events": new})
+                self._flushed_count = len(self.event_log)
+            if self._flushed_count > 500:
+                del self.event_log[:self._flushed_count]
+                self._flushed_count = 0
+            self._last_events_flush = now
+
+        if now - self._last_metrics >= cfg.metrics_flush_interval:
+            log = {"time": self.zm.fmt_ts(now)}
+            for zone in self.zm.zones_pixel:
+                log[zone] = {"current": len(self.zm.confirmed_inside[zone]),
+                             "entries": self.zm.zone_entry_count[zone],
+                             "exits":   self.zm.zone_exit_count[zone]}
+            self.metrics_log.append(log)
+            if len(self.metrics_log) > 120:
+                self.metrics_log = self.metrics_log[-120:]
+            self._enqueue_write(cfg.metrics_file, self.metrics_log)
+            self._last_metrics = now
+
+        return output, tracks, floor_map
+
+    def shutdown(self) -> None:
+        if self._gender_future is not None:
+            try: self._gender_future.result(timeout=2.0)
+            except Exception: pass
+        self._gender_executor.shutdown(wait=False)
+        self._io_loop.call_soon_threadsafe(self._io_loop.stop)
+        self._io_thread.join(timeout=3.0)
